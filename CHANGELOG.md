@@ -2,6 +2,14 @@
 
 本项目遵循“每次版本更新都记录变更”的约定。
 
+## 0.4.0 - 2026-10-20
+
+- 新增：语音组件（AstrBot TTS 的 `Record`）改用 `agent-wechat` 原生语音接口 `/api/messages/voice` 发送，微信端显示为语音条而不是音频文件
+- 语音发送使用 multipart 上传并携带 `Idempotency-Key`，随后轮询 `/api/messages/voice/{jobId}` 等待 `completed`，失败或超时会抛出明确错误
+- 修复：解析 `file:///` 本地路径时少截一个字符，导致图片/文件/语音发送报 `FileNotFoundError`
+- 修复：移除 0.3.16 引入的“群聊强制自动唤醒”，群聊恢复为必须 `@机器人` 或使用唤醒前缀
+- 新增：为 `agent_wechat` 注册 AstrBot 的 `unique_session` 构造器，开启会话隔离后群成员上下文互不串扰
+
 ## 0.3.18 - 2026-03-27
 
 - 修复“掉线重连后回灌离线消息”的问题

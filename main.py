@@ -31,12 +31,26 @@ except ImportError:
 
 AgentWeChatPlatformAdapter = _AgentWeChatPlatformAdapter
 
+# 为 agent_wechat 注册 AstrBot 的 unique_session 构造器：
+# 开启“会话隔离”后，群聊里每个成员会拥有独立的会话/上下文。
+try:
+    from astrbot.core.pipeline.waking_check.stage import (
+        UNIQUE_SESSION_ID_BUILDERS as _UNIQUE_SESSION_ID_BUILDERS,
+    )
+
+    _UNIQUE_SESSION_ID_BUILDERS.setdefault(
+        "agent_wechat",
+        lambda event: f"{event.get_sender_id()}_{event.get_group_id()}",
+    )
+except Exception:
+    pass
+
 
 @register(
     "astrbot_agent_wechat_bridge",
     "Codex",
     "AstrBot platform adapter for agent-wechat.",
-    "0.3.19",
+    "0.4.0",
 )
 class AgentWeChatBridgePlugin(Star):
     """加载平台适配器并完成注册。"""

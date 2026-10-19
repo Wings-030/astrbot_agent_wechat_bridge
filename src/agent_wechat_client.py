@@ -156,6 +156,43 @@ class WeChatClient:
     ) -> dict[str, Any]:
         return self._post("/api/messages/send", payload, timeout=timeout)
 
+    def send_voice(
+        self,
+        chat_id: str,
+        audio: bytes,
+        *,
+        idempotency_key: str,
+        filename: str = "voice.mp3",
+        mime_type: str = "audio/mpeg",
+        timeout: float | tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
+        """创建原生语音发送任务。
+
+        `/api/messages/voice` 使用 multipart 上传音频，必须携带
+        `Idempotency-Key`，返回的是异步 job 状态。
+        """
+        if not idempotency_key:
+            raise ValueError("idempotency_key is required for voice messages")
+
+        response = self._session().post(
+            f"{self.base_url}/api/messages/voice",
+            data={"chatId": chat_id},
+            files={"audio": (filename, audio, mime_type)},
+            headers={
+                # session 默认带 JSON Content-Type，会让 requests 不再生成 multipart 边界。
+                "Content-Type": None,
+                "Idempotency-Key": idempotency_key,
+            },
+            timeout=self.timeout if timeout is None else timeout,
+        )
+        if not response.ok:
+            raise AgentWeChatAPIError(f"{response.status_code}: {response.text}")
+        return response.json()
+
+    def get_voice_job(self, job_id: str) -> dict[str, Any]:
+        """查询语音发送任务状态。"""
+        return self._get(f"/api/messages/voice/{quote(job_id)}")
+
 
 Callback = Callable[..., Any | Awaitable[Any]]
 

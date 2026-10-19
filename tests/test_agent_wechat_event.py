@@ -589,3 +589,128 @@ def test_build_send_payloads_supports_serialized_video_component(monkeypatch):
             },
         }
     ]
+
+
+def test_build_send_payloads_record_returns_voice_payload(monkeypatch):
+    module = _load_event_module()
+    monkeypatch.setattr(
+        module,
+        "_load_binary_from_path",
+        lambda path, timeout=30, fallback_mime="application/octet-stream": (
+            b"tts-audio",
+            "audio/mpeg",
+            "tts.mp3",
+        ),
+    )
+    chain = module.MessageChain([module.Record(file="file:///tmp/tts.mp3")])
+
+    payloads = asyncio.run(
+        module.AgentWeChatMessageEvent._build_send_payloads("chat_voice", chain)
+    )
+
+    assert payloads == [
+        {
+            "chatId": "chat_voice",
+            "__voice": {
+                "data": "dHRzLWF1ZGlv",
+                "filename": "tts.mp3",
+                "mimeType": "audio/mpeg",
+            },
+        }
+    ]
+
+
+def test_send_message_chain_waits_for_voice_job(monkeypatch):
+    module = _load_event_module()
+    monkeypatch.setattr(module, "VOICE_JOB_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(
+        module,
+        "_load_binary_from_path",
+        lambda path, timeout=30, fallback_mime="application/octet-stream": (
+            b"tts-audio",
+            "audio/mpeg",
+            "tts.mp3",
+        ),
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+            self.states = [
+                {"status": "prepared"},
+                {"status": "completed", "chunks": [{"status": "verified"}]},
+            ]
+
+        def send_voice(self, chat_id, audio, **kwargs):
+            self.calls.append(("send", chat_id, audio, kwargs))
+            return {"jobId": "job-1", "status": "queued"}
+
+        def get_voice_job(self, job_id):
+            self.calls.append(("poll", job_id))
+            return self.states.pop(0)
+
+        def send_message(self, payload, timeout=None):
+            raise AssertionError("voice payload must not be sent as a file")
+
+    client = FakeClient()
+    chain = module.MessageChain([module.Record(file="file:///tmp/tts.mp3")])
+
+    asyncio.run(
+        module.AgentWeChatMessageEvent.send_message_chain(client, "chat_voice", chain)
+    )
+
+    assert client.calls[0][0] == "send"
+    assert client.calls[0][1] == "chat_voice"
+    assert client.calls[0][2] == b"tts-audio"
+    assert client.calls[0][3]["filename"] == "tts.mp3"
+    assert client.calls[0][3]["mime_type"] == "audio/mpeg"
+    assert client.calls[0][3]["idempotency_key"]
+    assert client.calls[1] == ("poll", "job-1")
+    assert client.calls[2] == ("poll", "job-1")
+
+
+def test_send_message_chain_raises_on_failed_voice_job(monkeypatch):
+    module = _load_event_module()
+    monkeypatch.setattr(
+        module,
+        "_load_binary_from_path",
+        lambda path, timeout=30, fallback_mime="application/octet-stream": (
+            b"tts-audio",
+            "audio/mpeg",
+            "tts.mp3",
+        ),
+    )
+
+    class FakeClient:
+        def send_voice(self, chat_id, audio, **kwargs):
+            return {"jobId": "job-2", "status": "queued"}
+
+        def get_voice_job(self, job_id):
+            return {"status": "failed", "error": "ffmpeg exploded"}
+
+    chain = module.MessageChain([module.Record(file="file:///tmp/tts.mp3")])
+
+    try:
+        asyncio.run(
+            module.AgentWeChatMessageEvent.send_message_chain(
+                FakeClient(), "chat_voice", chain
+            )
+        )
+    except RuntimeError as exc:
+        assert "ffmpeg exploded" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_load_binary_from_path_keeps_absolute_file_url(tmp_path):
+    module = _load_event_module()
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"voice-bytes")
+
+    data, mime_type, filename = module._load_binary_from_path(
+        f"file:///{audio.as_posix().lstrip('/')}"
+    )
+
+    assert data == b"voice-bytes"
+    assert filename == "voice.mp3"
+    assert mime_type in {"audio/mpeg", "audio/mp3"}

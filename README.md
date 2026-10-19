@@ -42,7 +42,8 @@ flowchart LR
 - 在 WS 事件或空闲超时后执行 REST 补偿同步
 - 将微信私聊和群聊消息转换为 AstrBot 事件
 - 将 AstrBot 的回复通过 `agent-wechat` 发回微信
-- 支持文本、图片、文件、语音类消息发送
+- 支持文本、图片、文件消息发送
+- 语音组件（如 AstrBot TTS 生成的 `Record`）通过 `agent-wechat` 原生语音接口 `/api/messages/voice` 发送为微信语音条
 - 配置项极简：仅需服务地址与访问令牌
 
 ## 运行前提

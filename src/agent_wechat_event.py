@@ -11,6 +11,7 @@ import os
 import re
 import time
 import unicodedata
+import uuid
 from collections.abc import AsyncGenerator
 from io import BytesIO
 from typing import Any
@@ -32,7 +33,7 @@ from astrbot.api.message_components import (
 )
 from astrbot.api.platform import Group
 
-from .agent_wechat_client import WeChatClient
+from .agent_wechat_client import AgentWeChatAPIError, WeChatClient
 
 SEND_REQUEST_TIMEOUT_SECONDS = 30.0
 SEND_LOG_PREFIX = "[agent_wechat][send]"
@@ -42,6 +43,9 @@ SEND_RECOVERY_ERRORS = {"No action selected"}
 IGNORED_SERIALIZED_SEG_TYPES = {"reply"}
 MAX_FILENAME_LENGTH = 96
 OUTBOUND_IMAGE_DEDUP_WINDOW_SECONDS = 8.0
+VOICE_JOB_POLL_INTERVAL_SECONDS = 1.0
+VOICE_JOB_TIMEOUT_SECONDS = 180.0
+VOICE_TERMINAL_FAILURE_STATES = {"failed", "cancelled", "canceled", "needs_review"}
 
 
 def _component_type_name(component: Any) -> str:
@@ -145,7 +149,7 @@ def _load_binary_from_path(
         )
         return response.content, mime_type, _basename_from_url(path)
 
-    normalized = path[8:] if path.startswith("file:///") else path
+    normalized = path[7:] if path.startswith("file:///") else path
     with open(normalized, "rb") as handle:
         data = handle.read()
     return (
@@ -388,13 +392,49 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                 )
                 continue
 
-            if isinstance(component, (File, Record, Video)):
+            if isinstance(component, Record):
                 source = getattr(component, "file", None) or getattr(
                     component, "url", None
                 )
                 if not source:
                     logger.warning(
-                        f"{SEND_LOG_PREFIX} skip file/record/video component without source "
+                        f"{SEND_LOG_PREFIX} skip record component without source "
+                        f"chat={chat_id}"
+                    )
+                    continue
+                data, mime_type, filename = await asyncio.to_thread(
+                    _load_binary_from_path, source, 30, "audio/mpeg"
+                )
+                text = "".join(text_buffer)
+                if text != "":
+                    payloads.append({"chatId": chat_id, "text": text})
+                text_buffer.clear()
+                payloads.append(
+                    {
+                        "chatId": chat_id,
+                        "__voice": {
+                            "data": base64.b64encode(data).decode("utf-8"),
+                            "filename": _sanitize_filename(
+                                str(
+                                    getattr(component, "name", None)
+                                    or filename
+                                    or "voice.mp3"
+                                ),
+                                "voice.mp3",
+                            ),
+                            "mimeType": mime_type or "audio/mpeg",
+                        },
+                    }
+                )
+                continue
+
+            if isinstance(component, (File, Video)):
+                source = getattr(component, "file", None) or getattr(
+                    component, "url", None
+                )
+                if not source:
+                    logger.warning(
+                        f"{SEND_LOG_PREFIX} skip file/video component without source "
                         f"chat={chat_id}"
                     )
                     continue
@@ -521,6 +561,91 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
             return False
 
     @classmethod
+    async def _send_voice_payload(
+        cls,
+        client: WeChatClient,
+        chat_id: str,
+        payload: dict[str, Any],
+        index: int,
+        total: int,
+    ) -> None:
+        """通过 agent-wechat 原生语音接口发送一条语音条。"""
+        voice = payload.get("__voice")
+        if not isinstance(voice, dict):
+            raise RuntimeError("agent-wechat 语音载荷格式错误")
+
+        try:
+            audio = base64.b64decode(str(voice.get("data") or ""))
+        except Exception as exc:
+            raise RuntimeError("agent-wechat 语音音频解码失败") from exc
+        if not audio:
+            raise RuntimeError("agent-wechat 语音音频为空")
+
+        try:
+            status = await asyncio.to_thread(
+                client.send_voice,
+                chat_id,
+                audio,
+                idempotency_key=uuid.uuid4().hex,
+                filename=str(voice.get("filename") or "voice.mp3"),
+                mime_type=str(voice.get("mimeType") or "audio/mpeg"),
+                timeout=SEND_REQUEST_TIMEOUT_SECONDS,
+            )
+        except requests.exceptions.RequestException as exc:
+            logger.exception(
+                f"{SEND_LOG_PREFIX} voice request error "
+                f"chat={chat_id} idx={index + 1}/{total}"
+            )
+            raise RuntimeError(f"agent-wechat 语音发送请求失败: {exc}") from exc
+        except AgentWeChatAPIError as exc:
+            logger.error(
+                f"{SEND_LOG_PREFIX} voice job create failed "
+                f"chat={chat_id} idx={index + 1}/{total} error={exc}"
+            )
+            raise RuntimeError(str(exc)) from exc
+
+        job_id = str(status.get("jobId") or "")
+        if not job_id:
+            raise RuntimeError(f"agent-wechat 语音任务创建失败: {status}")
+        logger.info(
+            f"{SEND_LOG_PREFIX} voice job created "
+            f"chat={chat_id} idx={index + 1}/{total} job={job_id}"
+        )
+
+        deadline = time.monotonic() + VOICE_JOB_TIMEOUT_SECONDS
+        while True:
+            state = str(status.get("status") or "")
+            if state == "completed":
+                logger.info(
+                    f"{SEND_LOG_PREFIX} voice job completed "
+                    f"chat={chat_id} job={job_id} "
+                    f"chunks={len(status.get('chunks') or [])}"
+                )
+                return
+            if state in VOICE_TERMINAL_FAILURE_STATES:
+                error = status.get("error") or state
+                logger.error(
+                    f"{SEND_LOG_PREFIX} voice job failed "
+                    f"chat={chat_id} job={job_id} status={state} error={error}"
+                )
+                raise RuntimeError(f"agent-wechat 语音发送失败: {error}")
+
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "agent-wechat 语音发送超时"
+                    f"（{VOICE_JOB_TIMEOUT_SECONDS:.0f} 秒未完成）"
+                )
+
+            await asyncio.sleep(VOICE_JOB_POLL_INTERVAL_SECONDS)
+            try:
+                status = await asyncio.to_thread(client.get_voice_job, job_id)
+            except (requests.exceptions.RequestException, AgentWeChatAPIError) as exc:
+                logger.warning(
+                    f"{SEND_LOG_PREFIX} voice job poll failed "
+                    f"chat={chat_id} job={job_id} error={exc}"
+                )
+
+    @classmethod
     async def send_message_chain(
         cls,
         client: WeChatClient,
@@ -541,6 +666,16 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
             return
 
         for idx, payload in enumerate(filtered_payloads):
+            if "__voice" in payload:
+                await cls._send_voice_payload(
+                    client,
+                    chat_id,
+                    payload,
+                    idx,
+                    len(filtered_payloads),
+                )
+                continue
+
             recovered = False
             for attempt in range(1, SEND_RECOVERY_RETRY_ATTEMPTS + 1):
                 try:
