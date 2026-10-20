@@ -33,15 +33,18 @@ AgentWeChatPlatformAdapter = _AgentWeChatPlatformAdapter
 
 # 为 agent_wechat 注册 AstrBot 的 unique_session 构造器：
 # 开启“会话隔离”后，群聊里每个成员会拥有独立的会话/上下文。
+# 使用 build_isolated_session_id 拼接 sender%group，发送侧可还原真实群号。
 try:
     from astrbot.core.pipeline.waking_check.stage import (
         UNIQUE_SESSION_ID_BUILDERS as _UNIQUE_SESSION_ID_BUILDERS,
     )
 
-    _UNIQUE_SESSION_ID_BUILDERS.setdefault(
-        "agent_wechat",
-        lambda event: f"{event.get_sender_id()}_{event.get_group_id()}",
-    )
+    try:
+        from .src.agent_wechat_access import build_isolated_session_id
+    except ImportError:
+        from src.agent_wechat_access import build_isolated_session_id
+
+    _UNIQUE_SESSION_ID_BUILDERS.setdefault("agent_wechat", build_isolated_session_id)
 except Exception:
     pass
 

@@ -1,10 +1,12 @@
 from src.agent_wechat_access import (
+    build_isolated_session_id,
     extract_leading_mentions,
     is_leading_self_mention,
     is_group_chat,
     is_sender_allowed,
     normalize_allowlist,
     normalize_wechat_id,
+    resolve_chat_id_from_session,
     should_forward_message,
     strip_leading_mentions,
 )
@@ -16,7 +18,10 @@ def test_normalize_wechat_id() -> None:
 
 
 def test_normalize_allowlist_deduplicates() -> None:
-    assert normalize_allowlist(["wxid_a", "wechat:wxid_a", "wxid_b"]) == ["wxid_a", "wxid_b"]
+    assert normalize_allowlist(["wxid_a", "wechat:wxid_a", "wxid_b"]) == [
+        "wxid_a",
+        "wxid_b",
+    ]
 
 
 def test_strip_leading_mentions() -> None:
@@ -74,3 +79,29 @@ def test_should_block_group_without_mention() -> None:
     )
     assert allowed is False
     assert reason == "mention_required"
+
+
+class _FakeEvent:
+    def __init__(self, sender_id: str, group_id: str | None = None) -> None:
+        self._sender_id = sender_id
+        self._group_id = group_id
+
+    def get_sender_id(self) -> str:
+        return self._sender_id
+
+    def get_group_id(self) -> str | None:
+        return self._group_id
+
+
+def test_build_isolated_session_id_roundtrips_group() -> None:
+    sid = build_isolated_session_id(_FakeEvent("wxid_a_b", "123456@chatroom"))
+    assert sid == "wxid_a_b%123456@chatroom"
+    assert resolve_chat_id_from_session(sid) == "123456@chatroom"
+
+
+def test_build_isolated_session_id_keeps_private_sender() -> None:
+    assert build_isolated_session_id(_FakeEvent("wxid_a_b", None)) == "wxid_a_b"
+
+
+def test_resolve_chat_id_passes_through_plain_session() -> None:
+    assert resolve_chat_id_from_session("123456@chatroom") == "123456@chatroom"

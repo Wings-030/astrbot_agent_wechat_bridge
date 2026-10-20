@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import sys
+import time
 import types
 
 
@@ -714,3 +715,138 @@ def test_load_binary_from_path_keeps_absolute_file_url(tmp_path):
     assert data == b"voice-bytes"
     assert filename == "voice.mp3"
     assert mime_type in {"audio/mpeg", "audio/mp3"}
+
+
+def test_voice_idempotency_key_is_stable_for_same_audio():
+    module = _load_event_module()
+    key = module._voice_idempotency_key("chat_voice", b"same-audio")
+    assert key == module._voice_idempotency_key("chat_voice", b"same-audio")
+    assert key != module._voice_idempotency_key("chat_voice", b"other-audio")
+    assert key != module._voice_idempotency_key("chat_other", b"same-audio")
+
+
+def test_build_send_payloads_serialized_node_voice_returns_voice_payload(monkeypatch):
+    module = _load_event_module()
+    monkeypatch.setattr(
+        module,
+        "_load_binary_from_path",
+        lambda path, timeout=30, fallback_mime="application/octet-stream": (
+            b"node-voice",
+            "audio/mpeg",
+            "node.mp3",
+        ),
+    )
+
+    class SerializedNodes:
+        async def to_dict(self):
+            return {
+                "messages": [
+                    {
+                        "data": {
+                            "content": [
+                                {
+                                    "type": "record",
+                                    "data": {"file": "file:///tmp/node.mp3"},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    chain = module.MessageChain([SerializedNodes()])
+    payloads = asyncio.run(
+        module.AgentWeChatMessageEvent._build_send_payloads("chat_sv", chain)
+    )
+
+    assert payloads == [
+        {
+            "chatId": "chat_sv",
+            "__voice": {
+                "data": "bm9kZS12b2ljZQ==",
+                "filename": "node.mp3",
+                "mimeType": "audio/mpeg",
+            },
+        }
+    ]
+
+
+def test_send_message_chain_serializes_same_chat():
+    module = _load_event_module()
+    order = []
+
+    class SlowClient:
+        def send_message(self, payload, timeout=None):
+            order.append(("start", payload["text"]))
+            time.sleep(0.05)
+            order.append(("end", payload["text"]))
+            return {"success": True}
+
+    async def run() -> None:
+        client = SlowClient()
+        await asyncio.gather(
+            module.AgentWeChatMessageEvent.send_message_chain(
+                client,
+                "chat_order",
+                module.MessageChain([module.Plain(text="first")]),
+            ),
+            module.AgentWeChatMessageEvent.send_message_chain(
+                client,
+                "chat_order",
+                module.MessageChain([module.Plain(text="second")]),
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert order == [
+        ("start", "first"),
+        ("end", "first"),
+        ("start", "second"),
+        ("end", "second"),
+    ]
+
+
+def test_send_message_chain_reports_partial_delivery(monkeypatch):
+    module = _load_event_module()
+    monkeypatch.setattr(
+        module,
+        "_load_binary_from_path",
+        lambda *args, **kwargs: (b"tts-audio", "audio/mpeg", "tts.mp3"),
+    )
+
+    class FailingVoiceClient:
+        def __init__(self):
+            self.sent = []
+
+        def send_message(self, payload, timeout=None):
+            self.sent.append(payload)
+            return {"success": True}
+
+        def send_voice(self, chat_id, audio, **kwargs):
+            return {"jobId": "job-9", "status": "queued"}
+
+        def get_voice_job(self, job_id):
+            return {"status": "failed", "error": "ffmpeg exploded"}
+
+    client = FailingVoiceClient()
+    chain = module.MessageChain(
+        [
+            module.Plain(text="文字部分"),
+            module.Record(file="file:///tmp/tts.mp3"),
+        ]
+    )
+
+    try:
+        asyncio.run(
+            module.AgentWeChatMessageEvent.send_message_chain(
+                client, "chat_partial", chain
+            )
+        )
+    except RuntimeError as exc:
+        assert "ffmpeg exploded" in str(exc)
+        assert "已成功发送 1/2 段" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert len(client.sent) == 1

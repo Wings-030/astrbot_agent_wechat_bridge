@@ -149,7 +149,15 @@ def _load_binary_from_path(
         )
         return response.content, mime_type, _basename_from_url(path)
 
-    normalized = path[7:] if path.startswith("file:///") else path
+    if path.startswith("file:///"):
+        # file:///C:/x -> C:/x（Windows 盘符）; file:///tmp/x -> /tmp/x（POSIX）
+        candidate = path[len("file:///") :]
+        if len(candidate) >= 2 and candidate[1] == ":" and candidate[0].isalpha():
+            normalized = candidate
+        else:
+            normalized = candidate if candidate.startswith("/") else f"/{candidate}"
+    else:
+        normalized = path
     with open(normalized, "rb") as handle:
         data = handle.read()
     return (
@@ -159,11 +167,53 @@ def _load_binary_from_path(
     )
 
 
+def _voice_idempotency_key(chat_id: str, audio: bytes) -> str:
+    """由 chatId + 音频内容派生幂等键。
+
+    同一段音频发往同一会话时键值恒定，因此请求超时后的重试不会在
+    微信里重复出现语音条。
+    """
+    digest = hashlib.sha256(audio).hexdigest()
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"agent-wechat:{chat_id}:{digest}").hex
+
+
+def _build_voice_payload(
+    chat_id: str,
+    data: bytes,
+    filename: str,
+    mime_type: str,
+) -> dict[str, Any]:
+    return {
+        "chatId": chat_id,
+        "__voice": {
+            "data": base64.b64encode(data).decode("utf-8"),
+            "filename": _sanitize_filename(filename, "voice.mp3"),
+            "mimeType": mime_type or "audio/mpeg",
+        },
+    }
+
+
+def _build_file_payload(
+    chat_id: str,
+    data: bytes,
+    filename: str,
+) -> dict[str, Any]:
+    return {
+        "chatId": chat_id,
+        "file": {
+            "data": base64.b64encode(data).decode("utf-8"),
+            "filename": _sanitize_filename(filename, "file.bin"),
+        },
+    }
+
+
 class AgentWeChatMessageEvent(AstrMessageEvent):
     """单条微信入站消息对应的事件封装。"""
 
     _recent_outbound_image_signatures: dict[str, float] = {}
     _outbound_image_dedup_lock = asyncio.Lock()
+    # 每个会话一把发送锁，保证回复按顺序送达。
+    _chat_send_locks: dict[str, asyncio.Lock] = {}
 
     def __init__(
         self,
@@ -292,7 +342,33 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                         expanded += 1
                         continue
 
-                    if seg_type in {"video", "file", "record", "audio"}:
+                    if seg_type in {"record", "audio"}:
+                        source = _extract_segment_source(seg_data)
+                        if not source:
+                            logger.warning(
+                                f"{SEND_LOG_PREFIX} skip serialized node voice without source "
+                                f"chat={chat_id}"
+                            )
+                            continue
+                        flush_node_text()
+                        data, mime_type, filename = await asyncio.to_thread(
+                            _load_binary_from_path, str(source), 30, "audio/mpeg"
+                        )
+                        payloads.append(
+                            _build_voice_payload(
+                                chat_id,
+                                data,
+                                _extract_segment_filename(
+                                    seg_data,
+                                    fallback=str(filename or "voice.mp3"),
+                                ),
+                                mime_type,
+                            )
+                        )
+                        expanded += 1
+                        continue
+
+                    if seg_type in {"video", "file"}:
                         source = _extract_segment_source(seg_data)
                         if not source:
                             logger.warning(
@@ -304,19 +380,14 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                         data, _, filename = await asyncio.to_thread(
                             _load_binary_from_path, str(source)
                         )
-                        safe_filename = _sanitize_filename(
-                            _extract_segment_filename(
-                                seg_data, fallback=str(filename or "file.bin")
-                            )
-                        )
                         payloads.append(
-                            {
-                                "chatId": chat_id,
-                                "file": {
-                                    "data": base64.b64encode(data).decode("utf-8"),
-                                    "filename": safe_filename,
-                                },
-                            }
+                            _build_file_payload(
+                                chat_id,
+                                data,
+                                _extract_segment_filename(
+                                    seg_data, fallback=str(filename or "file.bin")
+                                ),
+                            )
                         )
                         expanded += 1
                         continue
@@ -410,21 +481,14 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                     payloads.append({"chatId": chat_id, "text": text})
                 text_buffer.clear()
                 payloads.append(
-                    {
-                        "chatId": chat_id,
-                        "__voice": {
-                            "data": base64.b64encode(data).decode("utf-8"),
-                            "filename": _sanitize_filename(
-                                str(
-                                    getattr(component, "name", None)
-                                    or filename
-                                    or "voice.mp3"
-                                ),
-                                "voice.mp3",
-                            ),
-                            "mimeType": mime_type or "audio/mpeg",
-                        },
-                    }
+                    _build_voice_payload(
+                        chat_id,
+                        data,
+                        str(
+                            getattr(component, "name", None) or filename or "voice.mp3"
+                        ),
+                        mime_type,
+                    )
                 )
                 continue
 
@@ -441,21 +505,16 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                 data, _, filename = await asyncio.to_thread(
                     _load_binary_from_path, source
                 )
-                safe_filename = _sanitize_filename(
-                    str(getattr(component, "name", None) or filename or "file.bin")
-                )
                 text = "".join(text_buffer)
                 if text != "":
                     payloads.append({"chatId": chat_id, "text": text})
                 text_buffer.clear()
                 payloads.append(
-                    {
-                        "chatId": chat_id,
-                        "file": {
-                            "data": base64.b64encode(data).decode("utf-8"),
-                            "filename": safe_filename,
-                        },
-                    }
+                    _build_file_payload(
+                        chat_id,
+                        data,
+                        str(getattr(component, "name", None) or filename or "file.bin"),
+                    )
                 )
                 continue
 
@@ -480,23 +539,38 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                         if text != "":
                             payloads.append({"chatId": chat_id, "text": text})
                         text_buffer.clear()
-                        data, _, filename = await asyncio.to_thread(
-                            _load_binary_from_path, str(source)
-                        )
-                        safe_filename = _sanitize_filename(
-                            _extract_segment_filename(
-                                seg_data, fallback=str(filename or "file.bin")
+                        if seg_type in {"record", "audio"}:
+                            data, mime_type, filename = await asyncio.to_thread(
+                                _load_binary_from_path,
+                                str(source),
+                                30,
+                                "audio/mpeg",
                             )
-                        )
-                        payloads.append(
-                            {
-                                "chatId": chat_id,
-                                "file": {
-                                    "data": base64.b64encode(data).decode("utf-8"),
-                                    "filename": safe_filename,
-                                },
-                            }
-                        )
+                            payloads.append(
+                                _build_voice_payload(
+                                    chat_id,
+                                    data,
+                                    _extract_segment_filename(
+                                        seg_data,
+                                        fallback=str(filename or "voice.mp3"),
+                                    ),
+                                    mime_type,
+                                )
+                            )
+                        else:
+                            data, _, filename = await asyncio.to_thread(
+                                _load_binary_from_path, str(source)
+                            )
+                            payloads.append(
+                                _build_file_payload(
+                                    chat_id,
+                                    data,
+                                    _extract_segment_filename(
+                                        seg_data,
+                                        fallback=str(filename or "file.bin"),
+                                    ),
+                                )
+                            )
                         continue
 
                 expanded = await expand_serialized_nodes(serialized)
@@ -586,7 +660,7 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                 client.send_voice,
                 chat_id,
                 audio,
-                idempotency_key=uuid.uuid4().hex,
+                idempotency_key=_voice_idempotency_key(chat_id, audio),
                 filename=str(voice.get("filename") or "voice.mp3"),
                 mime_type=str(voice.get("mimeType") or "audio/mpeg"),
                 timeout=SEND_REQUEST_TIMEOUT_SECONDS,
@@ -665,73 +739,107 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
         if not filtered_payloads:
             return
 
+        # 同一会话的发送串行化：语音任务可能等待数十秒，
+        # 若不串行，后来的回复会插队，导致消息乱序。
+        async with cls._get_chat_send_lock(str(chat_id)):
+            await cls._send_payloads_serialized(client, chat_id, filtered_payloads)
+
+    @classmethod
+    def _get_chat_send_lock(cls, chat_id: str) -> asyncio.Lock:
+        lock = cls._chat_send_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            cls._chat_send_locks[chat_id] = lock
+        return lock
+
+    @classmethod
+    async def _send_payloads_serialized(
+        cls,
+        client: WeChatClient,
+        chat_id: str,
+        filtered_payloads: list[dict[str, Any]],
+    ) -> None:
+        total = len(filtered_payloads)
         for idx, payload in enumerate(filtered_payloads):
-            if "__voice" in payload:
-                await cls._send_voice_payload(
-                    client,
-                    chat_id,
+            try:
+                await cls._send_single_payload(client, chat_id, payload, idx, total)
+            except RuntimeError as exc:
+                if idx == 0:
+                    raise
+                # 前面的消息段已经发出，重试会重复投递；这里显式暴露部分送达状态。
+                raise RuntimeError(
+                    f"{exc}（已成功发送 {idx}/{total} 段，剩余 {total - idx} 段未发送）"
+                ) from exc
+
+    @classmethod
+    async def _send_single_payload(
+        cls,
+        client: WeChatClient,
+        chat_id: str,
+        payload: dict[str, Any],
+        idx: int,
+        total: int,
+    ) -> None:
+        if "__voice" in payload:
+            await cls._send_voice_payload(client, chat_id, payload, idx, total)
+            return
+
+        recovered = False
+        for attempt in range(1, SEND_RECOVERY_RETRY_ATTEMPTS + 1):
+            try:
+                result = await asyncio.to_thread(
+                    client.send_message,
                     payload,
-                    idx,
-                    len(filtered_payloads),
+                    timeout=SEND_REQUEST_TIMEOUT_SECONDS,
                 )
+            except requests.exceptions.ReadTimeout as exc:
+                logger.exception(
+                    f"{SEND_LOG_PREFIX} send payload timeout "
+                    f"chat={chat_id} idx={idx + 1}/{total}"
+                )
+                raise RuntimeError(
+                    "agent-wechat 发送超时（30秒未响应），"
+                    "请检查微信客户端是否卡在聊天切换/自动化操作中。"
+                ) from exc
+            except requests.exceptions.RequestException as exc:
+                logger.exception(
+                    f"{SEND_LOG_PREFIX} send payload request error "
+                    f"chat={chat_id} idx={idx + 1}/{total}"
+                )
+                raise RuntimeError(f"agent-wechat 发送请求失败: {exc}") from exc
+
+            if result.get("success", True):
+                recovered = True
+                break
+
+            error = str(result.get("error") or "")
+            recoverable = error in SEND_RECOVERY_ERRORS
+            if recoverable and attempt < SEND_RECOVERY_RETRY_ATTEMPTS:
+                logger.warning(
+                    f"{SEND_LOG_PREFIX} recoverable send error "
+                    f"chat={chat_id} idx={idx + 1}/{total} "
+                    f"attempt={attempt}/{SEND_RECOVERY_RETRY_ATTEMPTS} "
+                    f"error={error}; trying open_chat and retry"
+                )
+                try:
+                    await asyncio.to_thread(client.open_chat, chat_id, False)
+                except Exception as exc:
+                    logger.warning(
+                        f"{SEND_LOG_PREFIX} open_chat before retry failed "
+                        f"chat={chat_id} idx={idx + 1}/{total} error={exc}"
+                    )
+                await asyncio.sleep(SEND_RECOVERY_RETRY_INTERVAL_SECONDS)
                 continue
 
-            recovered = False
-            for attempt in range(1, SEND_RECOVERY_RETRY_ATTEMPTS + 1):
-                try:
-                    result = await asyncio.to_thread(
-                        client.send_message,
-                        payload,
-                        timeout=SEND_REQUEST_TIMEOUT_SECONDS,
-                    )
-                except requests.exceptions.ReadTimeout as exc:
-                    logger.exception(
-                        f"{SEND_LOG_PREFIX} send payload timeout "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
-                    )
-                    raise RuntimeError(
-                        "agent-wechat 发送超时（30秒未响应），"
-                        "请检查微信客户端是否卡在聊天切换/自动化操作中。"
-                    ) from exc
-                except requests.exceptions.RequestException as exc:
-                    logger.exception(
-                        f"{SEND_LOG_PREFIX} send payload request error "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
-                    )
-                    raise RuntimeError(f"agent-wechat 发送请求失败: {exc}") from exc
+            logger.error(
+                f"{SEND_LOG_PREFIX} send payload failed "
+                f"chat={chat_id} idx={idx + 1}/{total} "
+                f"error={error}"
+            )
+            raise RuntimeError(error or "agent-wechat 发送失败")
 
-                if result.get("success", True):
-                    recovered = True
-                    break
-
-                error = str(result.get("error") or "")
-                recoverable = error in SEND_RECOVERY_ERRORS
-                if recoverable and attempt < SEND_RECOVERY_RETRY_ATTEMPTS:
-                    logger.warning(
-                        f"{SEND_LOG_PREFIX} recoverable send error "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} "
-                        f"attempt={attempt}/{SEND_RECOVERY_RETRY_ATTEMPTS} "
-                        f"error={error}; trying open_chat and retry"
-                    )
-                    try:
-                        await asyncio.to_thread(client.open_chat, chat_id, False)
-                    except Exception as exc:
-                        logger.warning(
-                            f"{SEND_LOG_PREFIX} open_chat before retry failed "
-                            f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} error={exc}"
-                        )
-                    await asyncio.sleep(SEND_RECOVERY_RETRY_INTERVAL_SECONDS)
-                    continue
-
-                logger.error(
-                    f"{SEND_LOG_PREFIX} send payload failed "
-                    f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} "
-                    f"error={error}"
-                )
-                raise RuntimeError(error or "agent-wechat 发送失败")
-
-            if not recovered:
-                raise RuntimeError("agent-wechat 发送失败：重试后仍失败")
+        if not recovered:
+            raise RuntimeError("agent-wechat 发送失败：重试后仍失败")
 
     async def send(self, message: MessageChain) -> None:
         await self.send_message_chain(self.client, self.chat_id, message)

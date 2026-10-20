@@ -7,6 +7,12 @@
 - 新增：语音组件（AstrBot TTS 的 `Record`）改用 `agent-wechat` 原生语音接口 `/api/messages/voice` 发送，微信端显示为语音条而不是音频文件
 - 语音发送使用 multipart 上传并携带 `Idempotency-Key`，随后轮询 `/api/messages/voice/{jobId}` 等待 `completed`，失败或超时会抛出明确错误
 - 修复：解析 `file:///` 本地路径时少截一个字符，导致图片/文件/语音发送报 `FileNotFoundError`
+- 修复：`file:///` 路径现在同时兼容 POSIX 绝对路径与 Windows 盘符（`file:///C:/...`）
+- 修复：会话隔离（`unique_session`）开启后，发送会拿 `sender%group` 当 chatId 导致回复发往错误会话；现按分隔符还原真实群号
+- 修复：语音发送的 `Idempotency-Key` 改为由 chatId + 音频内容派生，超时重试不会重复发语音
+- 修复：`Node`/`Nodes` 序列化消息里的 `record`/`audio` 段改走原生语音接口，不再作为文件发送
+- 修复：同一会话的发送串行化，语音任务等待期间后续回复不会插队造成乱序
+- 改进：发送失败时明确提示已送达段数，避免把部分送达误判为整条未发送
 - 修复：移除 0.3.16 引入的“群聊强制自动唤醒”，群聊恢复为必须 `@机器人` 或使用唤醒前缀
 - 新增：为 `agent_wechat` 注册 AstrBot 的 `unique_session` 构造器，开启会话隔离后群成员上下文互不串扰
 

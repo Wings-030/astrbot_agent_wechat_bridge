@@ -30,6 +30,7 @@ from .agent_wechat_access import (
     is_group_chat,
     is_leading_self_mention,
     is_official_account,
+    resolve_chat_id_from_session,
     strip_leading_mentions,
 )
 from .agent_wechat_client import (
@@ -139,7 +140,9 @@ class AgentWeChatPlatformAdapter(Platform):
         cls._logout_notifier = notifier
 
     @classmethod
-    def set_logout_notify_policy(cls, *, interval_seconds: float, max_count: int) -> None:
+    def set_logout_notify_policy(
+        cls, *, interval_seconds: float, max_count: int
+    ) -> None:
         cls._logout_warn_interval_seconds = max(1.0, float(interval_seconds))
         cls._logout_warn_max_count = max(0, int(max_count))
 
@@ -194,6 +197,24 @@ class AgentWeChatPlatformAdapter(Platform):
 
     def get_client(self) -> WeChatClient:
         return self.client
+
+    def create_event(self, message: AstrBotMessage) -> AgentWeChatMessageEvent:
+        """为消息构造本平台的事件类（基类返回的通用事件 send() 是空实现）。
+
+        防抖等插件会用 create_event 重投消息，若返回通用 AstrMessageEvent，
+        回复阶段的 event.send() 不会真正发送，文字会被静默丢弃。
+        """
+        is_group = getattr(message, "type", None) == MessageType.GROUP_MESSAGE
+        chat_id = getattr(message, "group_id", None) if is_group else message.session_id
+        return AgentWeChatMessageEvent(
+            message_str=message.message_str,
+            message_obj=message,
+            platform_meta=self.meta(),
+            session_id=message.session_id,
+            client=self.client,
+            chat_id=str(chat_id),
+            is_group=bool(is_group),
+        )
 
     @staticmethod
     def _normalize_alias(value: str | None) -> str:
@@ -268,10 +289,7 @@ class AgentWeChatPlatformAdapter(Platform):
 
         self.last_login_page_warn_at = now
 
-        warn_text = (
-            "微信疑似已掉回登录页（auth=logged_out），"
-            "请打开 noVNC 完成重新登录"
-        )
+        warn_text = "微信疑似已掉回登录页（auth=logged_out），请打开 noVNC 完成重新登录"
         logger.warning(f"[agent_wechat] {warn_text}")
 
         notifier = self.__class__._logout_notifier
@@ -327,12 +345,15 @@ class AgentWeChatPlatformAdapter(Platform):
         session: MessageSesion,
         message_chain,
     ) -> None:
+        # 开启会话隔离后 session_id 会被改写成 sender%group，
+        # 发送时必须还原成真实 chatId，否则消息会发往不存在的会话。
+        chat_id = resolve_chat_id_from_session(str(session.session_id))
         await AgentWeChatMessageEvent.send_message_chain(
             self.client,
-            session.session_id,
+            chat_id,
             message_chain,
         )
-        self._touch_chat(str(session.session_id))
+        self._touch_chat(chat_id)
         await super().send_by_session(session, message_chain)
 
     async def run(self) -> None:
@@ -999,15 +1020,5 @@ class AgentWeChatPlatformAdapter(Platform):
         return path, mime_type, filename
 
     async def handle_msg(self, message: AstrBotMessage) -> None:
-        is_group = getattr(message, "type", None) == MessageType.GROUP_MESSAGE
-        chat_id = getattr(message, "group_id", None) if is_group else message.session_id
-        event = AgentWeChatMessageEvent(
-            message_str=message.message_str,
-            message_obj=message,
-            platform_meta=self.meta(),
-            session_id=message.session_id,
-            client=self.client,
-            chat_id=str(chat_id),
-            is_group=bool(is_group),
-        )
+        event = self.create_event(message)
         self.commit_event(event)
