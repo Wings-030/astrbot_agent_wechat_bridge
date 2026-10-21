@@ -63,8 +63,16 @@ ACTIVE_PROBE_FETCH_LIMIT = 2
 ACTIVE_PROBE_OPEN_CHAT = False
 ACTIVE_CHAT_KEEP = 8
 ACTIVE_CHAT_SEED = 2
-MEDIA_RETRY_ATTEMPTS = 4
-MEDIA_RETRY_INTERVAL_SECONDS = 0.25
+# 实测：微信客户端收到图片后要过几秒才把原图写盘，第一次取图常拿到 pending。
+# 所以给两次尝试、中间留几秒让文件落盘（单次超时压短，避免把轮询拖死）。
+MEDIA_RETRY_ATTEMPTS = 2
+MEDIA_RETRY_INTERVAL_SECONDS = 4.0
+# 媒体还没落本地时（type=pending），先「打开会话」让微信客户端去下载原图。
+MEDIA_OPEN_CHAT_BEFORE_FETCH = True
+MEDIA_TIMEOUT_SECONDS = 12.0
+# 首轮取图拿不到时，后台继续补抓：微信原图有时要 1~2 分钟才落盘。
+MEDIA_BACKGROUND_RETRY_INTERVAL_SECONDS = 5.0
+MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 150.0
 SELF_ID_ALIAS_RE = re.compile(r"^(wxid_[^_]+)(?:_[0-9a-fA-F]{4,})$")
 
 CONFIG_METADATA = {
@@ -482,6 +490,11 @@ class AgentWeChatPlatformAdapter(Platform):
                     and local_id
                     and local_id <= self.last_seen_id.get(chat_id, 0)
                 ):
+                    logger.debug(
+                        f"[agent_wechat][debug] ws skipped stale chat={chat_id} "
+                        f"localId={local_id} type={message.get('type')} "
+                        f"lastSeen={self.last_seen_id.get(chat_id, 0)}"
+                    )
                     return
                 converted = await self._convert_message(chat, message)
                 if converted is not None:
@@ -792,12 +805,21 @@ class AgentWeChatPlatformAdapter(Platform):
                 return
 
             for message in new_messages:
+                logger.debug(
+                    f"[agent_wechat][debug] candidate chat={chat_id} "
+                    f"localId={message.get('localId')} type={message.get('type')} "
+                    f"isSelf={message.get('isSelf')} sender={message.get('sender')}"
+                )
                 if bool(message.get("isSelf")):
                     self._add_self_alias(message.get("sender"))
                     self._add_self_alias(message.get("senderName"))
                     continue
                 converted = await self._convert_message(chat, message)
                 if converted is None:
+                    logger.debug(
+                        f"[agent_wechat][debug] convert returned None for "
+                        f"localId={message.get('localId')} type={message.get('type')}"
+                    )
                     continue
                 self._log_inbound_message(
                     source="rest",
@@ -888,6 +910,15 @@ class AgentWeChatPlatformAdapter(Platform):
                         message_str_parts.append("<media:audio>")
                     else:
                         message_str_parts.append(f"[file:{filename}]")
+            elif base_type == MSG_TYPE_IMAGE:
+                # 取图失败时明确告知，避免模型对着「没有图」的消息瞎猜。
+                components.append(Plain(text="[图片获取失败，无法查看这张图]"))
+                message_str_parts.append("[图片获取失败，无法查看这张图]")
+                # 微信原图常常要几十秒到两分钟才落盘，交给后台补抓。
+                with suppress(RuntimeError):
+                    asyncio.get_running_loop().create_task(
+                        self._background_media_retry(chat, message)
+                    )
 
         reply = message.get("reply")
         if isinstance(reply, dict) and reply.get("content"):
@@ -923,6 +954,55 @@ class AgentWeChatPlatformAdapter(Platform):
 
         return abm
 
+    async def _background_media_retry(
+        self,
+        chat: dict[str, Any],
+        message: dict[str, Any],
+    ) -> None:
+        """首轮取图失败后，在后台继续补抓，成功后补投一条带图的消息。"""
+        chat_id = str(chat.get("username") or chat.get("id") or "")
+        local_id = int(message.get("localId", 0) or 0)
+        if not chat_id or not local_id:
+            return
+
+        deadline = time.monotonic() + MEDIA_BACKGROUND_RETRY_MAX_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(MEDIA_BACKGROUND_RETRY_INTERVAL_SECONDS)
+            try:
+                media = await self._download_media(chat_id, local_id)
+            except Exception as exc:
+                logger.debug(
+                    f"[agent_wechat] background media retry error for {chat_id}:{local_id}: {exc}"
+                )
+                continue
+            if not media:
+                continue
+
+            converted = await self._convert_message(chat, message)
+            if converted is None:
+                return
+            converted.message.insert(
+                0, Plain(text="（刚才那张图现在加载好了，请结合这张图回答我刚才的问题）")
+            )
+            try:
+                event = self.create_event(converted)
+                # 与防抖插件一致：只设 is_wake 会被群聊主动回复的概率路径丢掉。
+                event.is_wake = True
+                event.is_at_or_wake_command = True
+                self.commit_event(event)
+                logger.info(
+                    f"[agent_wechat] late media delivered for {chat_id}:{local_id}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[agent_wechat] late media event failed for {chat_id}:{local_id}: {exc}"
+                )
+            return
+
+        logger.info(
+            f"[agent_wechat] background media retry gave up for {chat_id}:{local_id}"
+        )
+
     def _log_inbound_message(
         self,
         *,
@@ -953,22 +1033,35 @@ class AgentWeChatPlatformAdapter(Platform):
         chat_id: str,
         local_id: int,
     ) -> tuple[str, str, str] | None:
+        if MEDIA_OPEN_CHAT_BEFORE_FETCH:
+            # 微信客户端对未打开会话里的图片往往只留缩略图，先打开会话触发原图下载。
+            try:
+                await asyncio.to_thread(self.client.open_chat, chat_id, False)
+            except Exception as exc:
+                logger.debug(
+                    f"[agent_wechat] open_chat before media fetch failed for "
+                    f"{chat_id}:{local_id}: {exc}"
+                )
+
         result: dict[str, Any] | None = None
         for attempt in range(MEDIA_RETRY_ATTEMPTS):
             try:
                 candidate = await asyncio.to_thread(
-                    self.client.get_media, chat_id, local_id
+                    self.client.get_media, chat_id, local_id, MEDIA_TIMEOUT_SECONDS
                 )
             except AgentWeChatAPIError as exc:
                 logger.warning(
-                    f"[agent_wechat] media fetch failed for {chat_id}:{local_id}: {exc}"
+                    f"[agent_wechat] media fetch failed for {chat_id}:{local_id} "
+                    f"(attempt {attempt + 1}/{MEDIA_RETRY_ATTEMPTS}): {exc}"
                 )
-                return None
+                candidate = {}
             except Exception as exc:
+                # 超时多半是原图还没落盘，等一会儿再试，不能直接放弃。
                 logger.warning(
-                    f"[agent_wechat] media fetch error for {chat_id}:{local_id}: {exc}"
+                    f"[agent_wechat] media fetch error for {chat_id}:{local_id} "
+                    f"(attempt {attempt + 1}/{MEDIA_RETRY_ATTEMPTS}): {exc}"
                 )
-                return None
+                candidate = {}
 
             if candidate.get("type") == "unsupported":
                 return None

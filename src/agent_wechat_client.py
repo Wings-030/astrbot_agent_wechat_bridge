@@ -25,11 +25,17 @@ class WeChatClient:
     """对桥接服务接口的轻量封装。"""
 
     def __init__(
-        self, base_url: str, token: str | None = None, timeout: int = 15
+        self,
+        base_url: str,
+        token: str | None = None,
+        timeout: int = 40,
+        media_timeout: float | None = None,
     ) -> None:
         self.base_url = self._normalize_url(base_url)
         self.token = token
         self.timeout = timeout
+        # 取图/取媒体比普通接口慢得多（上游要现场下载原图），单独给更长超时。
+        self.media_timeout = media_timeout if media_timeout else timeout
         self.headers = {"Content-Type": "application/json"}
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
@@ -70,10 +76,10 @@ class WeChatClient:
             f"{quote(str(key))}={quote(str(value))}" for key, value in items
         )
 
-    def _get(self, path: str) -> Any:
+    def _get(self, path: str, timeout: float | None = None) -> Any:
         response = self._session().get(
             f"{self.base_url}{path}",
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else timeout,
         )
         if not response.ok:
             raise AgentWeChatAPIError(f"{response.status_code}: {response.text}")
@@ -146,8 +152,16 @@ class WeChatClient:
         )
         return result if isinstance(result, list) else []
 
-    def get_media(self, chat_id: str, local_id: int) -> dict[str, Any]:
-        return self._get(f"/api/messages/{quote(chat_id)}/media/{local_id}")
+    def get_media(
+        self,
+        chat_id: str,
+        local_id: int,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return self._get(
+            f"/api/messages/{quote(chat_id)}/media/{local_id}",
+            timeout=self.media_timeout if timeout is None else timeout,
+        )
 
     def send_message(
         self,
